@@ -175,16 +175,90 @@ def web_app():
             data=csv, file_name="seleccion.csv", 
             mime="text/csv" )
 
-def android_app():
-    a = 1
+def hana_odata():
+    import requests
+    from requests.auth import HTTPBasicAuth
+    import xml.etree.ElementTree as ET
+
+    # 1. Configuración de la conexión
+    # Reemplaza con tu host, puerto y ruta del servicio
+    base_url = "http://s4h2023.sapdemo.com:8003/sap/opu/odata/sap/ZVFD_CDS_VIEW_MARA_CDS"
+    entity_set = "/ZVFD_CDS_VIEW_MARA" # La tabla o entidad que quieres consultar
+    url = f"{base_url}{entity_set}"
+    
+    # Credenciales
+    username = "S23a85"
+    password = "Welcome@1234"
+
+    # 2. Parámetros OData (Filtros, Formato, etc.)
+    params = {
+        "$format": "xml",    # Cambiamos a XML
+        "$top": 10,          # Traer solo los primeros 10 registros (opcional)
+    }
+
+    try:
+        # 3. Realizar la petición GET
+        response = requests.get(
+            url,
+            auth=HTTPBasicAuth(username, password),
+            params=params
+        )
+
+        # 4. Validar respuesta
+        if response.status_code == 200:
+            print("✅ Conexión exitosa (XML)")
+            
+            # Parsear respuesta XML (Atom Pub format)
+            try:
+                root = ET.fromstring(response.content)
+                
+                # Namespaces comunes en OData v2
+                namespaces = {
+                    'atom': 'http://www.w3.org/2005/Atom',
+                    'm': 'http://schemas.microsoft.com/ado/2007/08/dataservices/metadata',
+                    'd': 'http://schemas.microsoft.com/ado/2007/08/dataservices'
+                }
+                
+                # Buscar todas las entradas <entry>
+                entries = root.findall('.//atom:entry', namespaces)
+                
+                if entries:
+                    print(f"Se encontraron {len(entries)} registros.")
+                    
+                    # Mostrar el primer registro como ejemplo
+                    first_entry = entries[0]
+                    properties = first_entry.find('.//m:properties', namespaces)
+                    
+                    if properties is not None:
+                        print("Primer registro:")
+                        for prop in properties:
+                            # Limpiar el nombre del tag para mostrarlo (quitar namespace)
+                            tag_name = prop.tag.split('}')[-1] 
+                            print(f"  {tag_name}: {prop.text}")
+                    else:
+                        print("No se encontraron propiedades en el primer registro.")
+                        
+                else:
+                    print("La consulta no devolvió resultados.")
+
+            except ET.ParseError as e:
+                print(f"❌ Error al parsear XML: {e}")
+                print("Contenido recibido:", response.text[:500]) # Mostrar inicio para debug
+        
+        else:
+            print(f"❌ Error {response.status_code}: {response.text}")
+
+    except Exception as e:
+        print(f"❌ Error de conexión: {str(e)}")
+    
 
 def main():
     # file_csv()
-     file_txt()
+    # file_txt()
     # insert_data()
     # create_tables()
     # web_app() # execute with "streamlit run sample_scripts.py" on terminal
-    # android_app()
+     hana_odata()
 
 if __name__ == '__main__':
   main()
