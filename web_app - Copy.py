@@ -1,0 +1,554 @@
+import streamlit as st
+import pandas as pd
+from hdbcli import dbapi
+import requests
+from requests.auth import HTTPBasicAuth
+import xml.etree.ElementTree as ET
+import subprocess
+import sys
+import os
+
+# -------------------------------------------------------------------------
+# DATABASE CONNECTION
+# -------------------------------------------------------------------------
+
+def hana_db():
+    """Establishes connection to SAP HANA"""
+    connection_details = {
+        "address": "TECH.SAPVISTA.COM",
+        "port": 30215,
+        "user": "TSVT_000019",
+        "password": "Welcome@891"
+    }
+    
+    try:
+        connection = dbapi.connect(
+            address=connection_details["address"],
+            port=connection_details["port"],
+            user=connection_details["user"],
+            password=connection_details["password"]
+        )
+        return connection
+    except Exception as e:
+        st.error(f"Failed to connect to HANA: {str(e)}")
+        return None
+
+def hana_odata():
+    # 1. Configuración de la conexión
+    # Reemplaza con tu host, puerto y ruta del servicio
+    base_url = "http://s4h2023.sapdemo.com:8003/sap/opu/odata/sap/ZVFD_CDS_VIEW_DD03M_CDS"
+    entity_set = "/ZVFD_CDS_VIEW_DD03M" # La tabla o entidad que quieres consultar
+    url = f"{base_url}{entity_set}"
+    
+    # Credenciales
+    username = "S23a85"
+    password = "Welcome@1234"
+
+    # 2. Parámetros OData (Filtros, Formato, etc.)
+    params = {
+        "$format": "xml",    # Cambiamos a XML
+    #    "$top": 100,          # Traer solo los primeros 10 registros (opcional)
+    }
+
+    try:
+        # 3. Realizar la petición GET
+        response = requests.get(
+            url,
+            auth=HTTPBasicAuth(username, password),
+            params=params
+        )
+
+        # 4. Validar respuesta
+        if response.status_code == 200:
+            st.success("✅ Conexión exitosa (XML)")
+            
+            # Parsear respuesta XML (Atom Pub format)
+            try:
+                root = ET.fromstring(response.content)
+                
+                # Namespaces comunes en OData v2
+                namespaces = {
+                    'atom': 'http://www.w3.org/2005/Atom',
+                    'm': 'http://schemas.microsoft.com/ado/2007/08/dataservices/metadata',
+                    'd': 'http://schemas.microsoft.com/ado/2007/08/dataservices'
+                }
+                
+                # Buscar todas las entradas <entry>
+                entries = root.findall('.//atom:entry', namespaces)
+                
+                if entries:
+                    data_list = []
+                    for entry in entries:
+                        properties = entry.find('.//m:properties', namespaces)
+                        if properties is not None:
+                            row = {}
+                            for prop in properties:
+                                tag_name = prop.tag.split('}')[-1] 
+                                row[tag_name] = prop.text
+                            data_list.append(row)
+                    
+                    if data_list:
+                        return pd.DataFrame(data_list)
+                    else:
+                        st.warning("No data found in the response.")
+                        return pd.DataFrame()
+                else:
+                    st.warning("La consulta no devolvió resultados.")
+                    return pd.DataFrame()
+
+            except ET.ParseError as e:
+                st.error(f"❌ Error al parsear XML: {e}")
+                return pd.DataFrame()
+        
+        else:
+            st.error(f"❌ Error {response.status_code}: {response.text}")
+            return pd.DataFrame()
+
+    except Exception as e:
+        st.error(f"❌ Error de conexión: {str(e)}")
+        return pd.DataFrame()
+
+def fetch_table_fields(table_list):
+    """
+    Fetches field metadata for the given list of tables from SAPHANADB.DD03M.
+    Returns a pandas DataFrame.
+    """
+    if not table_list:
+        return pd.DataFrame()
+
+    # Format list for SQL IN clause: 'TAB1', 'TAB2', ...
+    formatted_tables = ", ".join([f"'{t}'" for t in table_list])
+    
+    sql_query = f"""
+    SELECT 
+        TABNAME, FIELDNAME, DDLANGUAGE, KEYFLAG, LOGFLAG, 
+        DATATYPE, LENG, DECIMALS, CONVEXIT, DDTEXT, 
+        REPTEXT, SCRTEXT_S, SCRTEXT_M, SCRTEXT_L 
+    FROM SAPHANADB.DD03M 
+    WHERE TABNAME IN ({formatted_tables}) AND DDLANGUAGE = 'E' AND DOMSTAT = 'A'
+    """
+    
+    conn = hana_db()
+    if conn:
+        try:
+            df = pd.read_sql(sql_query, conn)
+            conn.close()
+            return df
+        except Exception as e:
+            st.error(f"Error executing query: {str(e)}")
+            conn.close()
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+def load_tables_from_csv(csv_path):
+    """Reads unique table names from the input CSV"""
+    try:
+        df = pd.read_csv(csv_path, sep=";")
+        if 'TABNAME' in df.columns:
+            # Clean and get unique tables
+            return df['TABNAME'].dropna().unique().tolist()
+        return []
+    except Exception as e:
+        st.error(f"Error reading CSV: {str(e)}")
+        return []
+
+def parse_uploaded_csv(file_obj):
+    """Reads metadata from an uploaded CSV file object"""
+    try:
+        # Assuming ; separator as per project standard, but usually uploads might be comma. 
+        # Start with ; to match existing load_tables_from_csv logic
+        df = pd.read_csv(file_obj, sep=";") 
+        return df
+    except Exception as e:
+        st.error(f"Error reading CSV file: {str(e)}")
+        return pd.DataFrame()
+
+# -------------------------------------------------------------------------
+# STATE MANAGEMENT ACTIONS
+# -------------------------------------------------------------------------
+
+def refresh_editors():
+    st.session_state.editor_key += 1
+
+def toggle_table_selection(t_name):
+    key = f"chk_{t_name}"
+    if key in st.session_state:
+        new_state = st.session_state[key]
+        t_indices = st.session_state.master_df[st.session_state.master_df['Table Name'] == t_name].index
+        st.session_state.master_df.loc[t_indices, 'Select'] = new_state
+        st.session_state.editor_key += 1
+
+def toggle_global_selection():
+    if "global_select" in st.session_state:
+        new_state = st.session_state.global_select
+        st.session_state.master_df['Select'] = new_state
+        st.session_state.editor_key += 1
+
+# -------------------------------------------------------------------------
+# MAIN APP
+# -------------------------------------------------------------------------
+
+def main():
+    st.set_page_config(page_title="SAP HANA Schema Explorer", layout="wide")
+    st.title("BD Schema Explorer (HANA Connected)")
+
+    hana_tables_path = r"D:\Users\eypze\Documents\Project Very Fast Data\tables_hana.csv"
+
+    # SELECTION & EXECUTION
+    col1, col2, col3 = st.columns([0.1, 0.1, 0.7])
+    with col1:
+        source_option = st.selectbox("Select Data Source", ["Select...", "HANA DB", "SAP OData", "CSV File"])
+    
+    uploaded_file = None
+    if source_option == "CSV File":
+        with col3:
+            uploaded_file = st.file_uploader("Upload CSV", type=["csv", "txt"], label_visibility="collapsed")
+    
+    with col2:
+        st.write("") # Spacer
+        st.write("") # Spacer
+        run_btn = st.button("Show Tables", width="content")
+
+    # ACTION LOGIC
+    if run_btn:
+        if source_option == "HANA DB":
+            with st.spinner("Connecting to HANA and fetching metadata..."):
+                # 1. Read tables from CSV
+                target_tables = load_tables_from_csv(hana_tables_path)
+                
+                if not target_tables:
+                    st.warning("No tables found in the CSV file.")
+                    st.stop()
+                    
+                # 2. Fetch data from HANA
+                df = fetch_table_fields(target_tables)
+                
+                if df.empty:
+                    st.error("No data found for the specified tables in HANA.")
+                    st.stop()
+                    
+                # 3. Prepare Master DF structure
+                master_df = df.copy()
+                
+                rename_map = {
+                    'TABNAME': 'Table Name', 
+                    'FIELDNAME': 'Field Name', 
+                    'DDTEXT': 'Description',
+                    'DATATYPE': 'Type',
+                    'LENG': 'Len',
+                    'DECIMALS': 'Dec'
+                }
+                master_df.rename(columns=rename_map, inplace=True)
+                
+                if 'Description' in master_df.columns:
+                    master_df['Description'] = master_df['Description'].fillna('')
+
+                master_df.sort_values(by=['Table Name', 'Field Name'], ascending=[True, True], inplace=True)
+                master_df.reset_index(drop=True, inplace=True)
+                
+                master_df.insert(0, "Select", False)
+                master_df['Select'] = master_df['Select'].astype(bool)
+                
+                st.session_state.master_df = master_df
+                st.session_state.editor_key = 0
+                st.success(f"Loaded metadata for {len(target_tables)} tables.")
+        
+        elif source_option == "SAP OData":
+            with st.spinner("Fetching data from OData service..."):
+                df = hana_odata()
+                
+                if df.empty:
+                    st.error("No data found from OData service.")
+                    st.stop()
+                
+                master_df = df.copy()
+                
+                rename_map = {
+                    'TABNAME': 'Table Name', 
+                    'FIELDNAME': 'Field Name', 
+                    'DDTEXT': 'Description',
+                    'DATATYPE': 'Type',
+                    'LENG': 'Len',
+                    'DECIMALS': 'Dec'
+                }
+                
+                # Ensure keys are upper for consistency with map, if needed
+                master_df.columns = [c.upper() for c in master_df.columns]
+                master_df.rename(columns=rename_map, inplace=True)
+                
+                # Ensure needed columns exist even if data is partial
+                required_cols = ['Table Name', 'Field Name']
+                for c in required_cols:
+                    if c not in master_df.columns:
+                        st.error(f"Missing required column from OData: {c}")
+                        st.stop()
+
+                if 'Description' in master_df.columns:
+                    master_df['Description'] = master_df['Description'].fillna('')
+                else:
+                    master_df['Description'] = '' # Fallback if missing
+
+                master_df.sort_values(by=['Table Name', 'Field Name'], ascending=[True, True], inplace=True)
+                master_df.reset_index(drop=True, inplace=True)
+                
+                master_df.insert(0, "Select", False)
+                master_df['Select'] = master_df['Select'].astype(bool)
+                
+                st.session_state.master_df = master_df
+                st.session_state.editor_key = 0
+                st.success(f"Loaded metadata from OData.")
+
+        elif source_option == "CSV File":
+            if uploaded_file is None:
+                st.warning("⚠️ Please upload a CSV file first.")
+                st.stop()
+
+            with st.spinner("Processing CSV file..."):
+                df = parse_uploaded_csv(uploaded_file)
+                
+                if df.empty:
+                    st.error("The uploaded CSV is empty or could not be parsed.")
+                    st.stop()
+                
+                master_df = df.copy()
+                
+                # Normalize Columns
+                rename_map = {
+                    'TABNAME': 'Table Name', 
+                    'FIELDNAME': 'Field Name', 
+                    'DDTEXT': 'Description',
+                    'DATATYPE': 'Type',
+                    'LENG': 'Len',
+                    'DECIMALS': 'Dec'
+                    #'TABLE NAME': 'Table Name',
+                    #'FIELD NAME': 'Field Name',
+                    #'DESCRIPTION': 'Description',
+                    #'TYPE': 'Type',
+                    #'LEN': 'Len',
+                    #'DEC': 'Dec'
+                }
+                
+                # Make upper just in case
+                master_df.columns = [str(c).upper().strip() for c in master_df.columns]
+                master_df.rename(columns=rename_map, inplace=True)
+                
+                # Check required
+                required_cols = ['Table Name', 'Field Name']
+                for c in required_cols:
+                    if c not in master_df.columns:
+                        st.error(f"CSV is missing required column: '{c}'. Found: {master_df.columns.tolist()}")
+                        st.stop()
+
+                if 'Description' in master_df.columns:
+                    master_df['Description'] = master_df['Description'].fillna('')
+                else:
+                    master_df['Description'] = ''
+
+                master_df.sort_values(by=['Table Name', 'Field Name'], ascending=[True, True], inplace=True)
+                master_df.reset_index(drop=True, inplace=True)
+                
+                master_df.insert(0, "Select", False)
+                master_df['Select'] = master_df['Select'].astype(bool)
+                
+                st.session_state.master_df = master_df
+                st.session_state.editor_key = 0
+                st.success(f"✅ Loaded {len(master_df)} fields from CSV.")
+
+    # Ensure we have data before rendering UI
+    if "master_df" not in st.session_state:
+        st.info("Please select a source and click 'Run' to begin.")
+        st.stop()
+
+    # ---------------------------------------------------------------------
+    # UI RENDERING
+    # ---------------------------------------------------------------------
+
+    st.subheader("Select Fields by Table")
+
+    # Global Actions
+    global_all_selected = bool(st.session_state.master_df['Select'].all())
+    st.session_state['global_select'] = global_all_selected
+
+    st.checkbox(
+        "Select All Tables",
+        key="global_select",
+        on_change=toggle_global_selection
+    )
+
+    unique_tables = st.session_state.master_df['Table Name'].unique()
+
+    for table_name in unique_tables:
+        table_indices = st.session_state.master_df[st.session_state.master_df['Table Name'] == table_name].index
+        # Get fresh data copy
+        current_data = st.session_state.master_df.loc[table_indices].copy()
+        
+        is_fully_selected = bool(current_data['Select'].all())
+        n_selected = current_data['Select'].sum()
+        n_total = len(current_data)
+        
+        # Sync widget state
+        st.session_state[f"chk_{table_name}"] = is_fully_selected
+
+        # Layout
+        c_check, c_exp, c_stats = st.columns([0.05, 0.80, 0.15])
+        
+        with c_check:
+            st.checkbox(
+                "Select Table", 
+                key=f"chk_{table_name}", 
+                on_change=toggle_table_selection, 
+                args=(table_name,),
+                label_visibility="collapsed"
+            )
+        
+        with c_stats:
+            st.write(f":gray[**{n_selected} / {n_total}**]")
+        
+        with c_exp:
+            with st.expander(f"Table: {table_name}", expanded=False):
+                # Inner Buttons
+                c_btn_sel, c_btn_desel = st.columns(2)
+                if c_btn_sel.button("Select All Fields", key=f"btn_sel_{table_name}"):
+                    st.session_state.master_df.loc[table_indices, 'Select'] = True
+                    st.session_state.editor_key += 1
+                    st.rerun()
+                
+                if c_btn_desel.button("Deselect All Fields", key=f"btn_desel_{table_name}"):
+                    st.session_state.master_df.loc[table_indices, 'Select'] = False
+                    st.session_state.editor_key += 1
+                    st.rerun()
+
+                # Editor
+                editor_key_inst = f"editor_{table_name}_{st.session_state.editor_key}"
+                
+                # Define columns to show in the UI (subset of full metadata)
+                ui_cols = ['Select', 'Table Name', 'Field Name', 'Description', 'Type', 'Len', 'Dec']
+                # Filter current data to only UI columns for display
+                # We use .get to suffice if some cols are missing from logic, though they shouldn't be
+                valid_ui_cols = [c for c in ui_cols if c in current_data.columns]
+                display_data = current_data[valid_ui_cols]
+
+                edited_slice = st.data_editor(
+                    display_data,
+                    key=editor_key_inst,
+                    column_config={
+                        "Select": st.column_config.CheckboxColumn("Select", default=False),
+                        "Table Name": st.column_config.TextColumn("Table Name", disabled=True),
+                        "Field Name": st.column_config.TextColumn("Field Name", disabled=True),
+                        "Description": st.column_config.TextColumn("Description", disabled=True),
+                        "Type": st.column_config.TextColumn("Type", disabled=True),
+                        "Len": st.column_config.NumberColumn("Len", disabled=True),
+                        "Dec": st.column_config.NumberColumn("Dec", disabled=True),
+                    },
+                    hide_index=True,
+                    use_container_width=True
+                )
+                
+                # Update Logic
+                # Check if the displayed slice changed
+                if not edited_slice.equals(display_data):
+                    # We only care about the Select column changing
+                    # Update master_df's Select column at the specific indices
+                    new_selection = edited_slice['Select'].astype(bool)
+                    st.session_state.master_df.loc[table_indices, 'Select'] = new_selection
+                    st.rerun()
+
+    # ---------------------------------------------------------------------
+    # FINAL REPORT
+    # ---------------------------------------------------------------------
+    st.divider()
+
+    summary_stats = st.session_state.master_df.groupby('Table Name')['Select'].agg(
+        Selected='sum', 
+        Total='count'
+    ).reset_index()
+
+    summary_stats = summary_stats[summary_stats['Selected'] > 0]
+
+    if not summary_stats.empty:
+        st.subheader(f"✅ Selection Summary ({summary_stats['Selected'].sum()} fields across {len(summary_stats)} tables)")
+        
+        st.dataframe(
+            summary_stats.rename(columns={'Selected': 'Selected Fields', 'Total': 'Total Fields'}),
+            hide_index=True,
+            #use_container_width=True
+            width="content"
+        )
+
+        # For download, use the original name for ALL columns from master_df (Full Metadata) for selected rows
+        selected_rows = st.session_state.master_df[st.session_state.master_df['Select']]
+
+        rename_map = {
+            'Table Name' : 'TABNAME', 
+            'Field Name' : 'FIELDNAME', 
+            'Description' : 'DDTEXT',
+            'Type' : 'DATATYPE',
+            'Len' : 'LENG',
+            'Dec' : 'DECIMALS'
+        }
+        selected_rows.rename(columns=rename_map, inplace=True)
+        final_report = selected_rows.drop(columns=['Select'])
+
+        csv = final_report.to_csv(index=False, sep=";").encode("utf-8")
+
+        deploy_col1, deploy_col2, _ = st.columns([0.15, 0.1, 0.7])
+        with deploy_col1:
+            deploy_action = st.selectbox(
+                "Select Target",
+                options=["Select...", "Download CSV File", "GCP", "AWS", "Azure"],
+                label_visibility="visible"
+            )
+        with deploy_col2:
+            st.write("") # Spacer
+            st.write("") # Spacer
+            if deploy_action == "Download CSV File":
+                st.download_button(
+                    label="Deploy",
+                    data=csv,
+                    file_name="selection.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+            else:
+                deploy_btn = st.button("Deploy", use_container_width=True)
+                if deploy_btn:
+                    if deploy_action == "Select...":
+                        st.warning("⚠️ Please select a deploy action first.")
+                    elif deploy_action == "GCP":
+                        with st.spinner("Processing GCP Deployment..."):
+                            try:
+                                # 1. Ensure the directory exists
+                                gcp_csv_path = r"D:\Users\eypze\Documents\Project Very Fast Data\selection.csv"
+                                # We already have final_report from above
+                                final_report.to_csv(gcp_csv_path, index=False, sep=";")
+                                
+                                # 2. Run the script using the current python interpreter
+                                script_path = os.path.join(os.path.dirname(__file__), "gcp_tables_deploy.py")
+                                result = subprocess.run(
+                                    [sys.executable, script_path],
+                                    capture_output=True,
+                                    text=True,
+                                    check=False
+                                )
+                                
+                                # 3. Show Output
+                                if result.returncode == 0:
+                                    st.success("✅ GCP Deployment completed successfully.")
+                                    with st.expander("Show Detailed Output"):
+                                        st.code(result.stdout)
+                                else:
+                                    st.error(f"❌ GCP Deployment failed with exit code {result.returncode}")
+                                    with st.expander("Show Error Details"):
+                                        st.code(result.stderr)
+                                        st.write("---")
+                                        st.code(result.stdout)
+                                        
+                            except Exception as e:
+                                st.error(f"An error occurred during deployment: {str(e)}")
+                    else:
+                        st.info(f"🚀 Deploy to **{deploy_action}** — coming soon!")
+    else:
+        st.info("No fields selected.")
+
+if __name__ == "__main__":
+    main() # execute in terminal with "streamlit run web_app.py"
