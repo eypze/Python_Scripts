@@ -258,7 +258,11 @@ def main():
     # insert_data()
     # create_tables()
     # web_app() # execute with "streamlit run sample_scripts.py" on terminal
-     hana_odata()
+    # hana_odata()
+
+    wrld = "/camino"
+    wrld = wrld.replace("/","_")
+    print(wrld)
 
 if __name__ == '__main__':
   main()
